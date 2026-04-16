@@ -89,6 +89,26 @@ export async function POST(request: Request) {
   const requestId = crypto.randomUUID();
   const timer = createRequestTimer("/api/chat", requestId);
   try {
+    // Fail fast with actionable errors for missing runtime configuration.
+    if (!process.env.OPENAI_API_KEY) {
+      return NextResponse.json(
+        { error: "OPENAI_API_KEY is not configured" },
+        { status: 500 }
+      );
+    }
+    if (!process.env.PINECONE_API_KEY) {
+      return NextResponse.json(
+        { error: "PINECONE_API_KEY is not configured" },
+        { status: 500 }
+      );
+    }
+    if (!process.env.PINECONE_INDEX_NAME) {
+      return NextResponse.json(
+        { error: "PINECONE_INDEX_NAME is not configured" },
+        { status: 500 }
+      );
+    }
+
     const authStartedAt = Date.now();
     const { userId } = await auth();
     timer.stage("auth_checked", authStartedAt, { hasUserId: Boolean(userId) });
@@ -209,6 +229,10 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     console.error(`[/api/chat][${requestId}] failed`, toErrorDetails(error));
-    return toErrorResponse(error, "Failed to process chat request.");
+    // Never leak secrets, but return a helpful message for debugging missing config.
+    if (error instanceof Error) {
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+    return NextResponse.json({ error: "Failed to process chat request." }, { status: 500 });
   }
 }
