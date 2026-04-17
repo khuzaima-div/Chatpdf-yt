@@ -6,7 +6,7 @@ import { chats, messages } from "@/lib/db/schema";
 import { getEmbeddingsClient } from "@/lib/ai/embeddings";
 import { getPineconeClient } from "@/lib/vector/pinecone";
 import { toVectorNamespace } from "@/lib/chat/namespace";
-import { toErrorDetails, toErrorResponse } from "@/lib/server/errors";
+import { toErrorDetails } from "@/lib/server/errors";
 import { withTimeout } from "@/lib/server/timeout";
 import { createRequestTimer } from "@/lib/server/request-timing";
 
@@ -14,6 +14,7 @@ const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 const DB_TIMEOUT_MS = 12000;
 const VECTOR_TIMEOUT_MS = 15000;
 const OPENAI_TIMEOUT_MS = 25000;
+const NO_CONTEXT_FALLBACK = "This information is not available in the document.";
 
 function buildContextFromMatches(matches: Array<{ metadata?: Record<string, unknown> }>) {
   return matches
@@ -83,6 +84,23 @@ Rules:
   };
 
   return data.choices?.[0]?.message?.content?.trim() || "I could not generate an answer.";
+}
+
+function buildNoContextAnswer(question: string) {
+  const lower = question.toLowerCase();
+  const isGreeting =
+    lower === "hi" ||
+    lower === "hello" ||
+    lower === "hey" ||
+    lower.startsWith("hi ") ||
+    lower.startsWith("hello ") ||
+    lower.startsWith("hey ");
+
+  if (isGreeting) {
+    return "Hello! Ask me anything about the uploaded PDF, and I will help using the document content.";
+  }
+
+  return NO_CONTEXT_FALLBACK;
 }
 
 export async function POST(request: Request) {
@@ -159,16 +177,26 @@ export async function POST(request: Request) {
 
     const embedStartedAt = Date.now();
     const embeddings = getEmbeddingsClient();
-    const [queryVector] = await withTimeout(
-      embeddings.embedDocuments([question]),
+    const queryVector = await withTimeout(
+      embeddings.embedQuery(question),
       VECTOR_TIMEOUT_MS,
       "Embedding request timed out."
     );
-    timer.stage("question_embedded", embedStartedAt);
+    timer.stage("question_embedded", embedStartedAt, {
+      vectorDimensions: Array.isArray(queryVector) ? queryVector.length : 0,
+    });
 
     const pinecone = getPineconeClient();
-    const index = pinecone.index(process.env.PINECONE_INDEX_NAME!);
+    const indexName = process.env.PINECONE_INDEX_NAME!;
+    const index = pinecone.index(indexName);
     const namespace = toVectorNamespace(chat.fileKey);
+    console.log(`[/api/chat][${requestId}] pinecone_query_start`, {
+      chatId: chat.id,
+      fileKey: chat.fileKey,
+      namespace,
+      indexName,
+      topK: 5,
+    });
 
     const vectorSearchStartedAt = Date.now();
     const searchResults = await withTimeout(
@@ -183,13 +211,42 @@ export async function POST(request: Request) {
     timer.stage("vector_search_completed", vectorSearchStartedAt, {
       matchCount: searchResults.matches?.length ?? 0,
     });
+    console.log(`[/api/chat][${requestId}] pinecone_query_result`, {
+      namespace,
+      indexName,
+      matchCount: searchResults.matches?.length ?? 0,
+      topScore:
+        searchResults.matches && searchResults.matches.length > 0
+          ? searchResults.matches[0]?.score ?? null
+          : null,
+      matchIds: (searchResults.matches ?? []).map((m) => m.id).slice(0, 5),
+    });
 
     const context = buildContextFromMatches(
       (searchResults.matches ?? []) as Array<{ metadata?: Record<string, unknown> }>
     );
-    const answerStartedAt = Date.now();
-    const answer = await generateAnswer(question, context);
-    timer.stage("openai_answer_generated", answerStartedAt);
+    console.log(`[/api/chat][${requestId}] context_built`, {
+      hasContext: context.length > 0,
+      contextLength: context.length,
+    });
+
+    let answer: string;
+    if (!context) {
+      answer = buildNoContextAnswer(question);
+      console.log(`[/api/chat][${requestId}] no_context_fallback_used`, {
+        answer,
+      });
+    } else {
+      const answerStartedAt = Date.now();
+      answer = await generateAnswer(question, context);
+      timer.stage("openai_answer_generated", answerStartedAt, {
+        usedContext: true,
+        responseLength: answer.length,
+      });
+      console.log(`[/api/chat][${requestId}] openai_answer_ready`, {
+        responseLength: answer.length,
+      });
+    }
 
     const saveSystemMessageStartedAt = Date.now();
     await withTimeout(

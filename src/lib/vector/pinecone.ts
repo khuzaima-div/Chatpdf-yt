@@ -78,6 +78,9 @@ export async function loadS3IntoPinecone(
       metadata: (page.metadata ?? {}) as Record<string, unknown>,
     }));
     stage("pdf_loaded", parseStartedAt, { pages: pages.length });
+    if (pages.length === 0) {
+      throw new Error("No pages were extracted from the uploaded PDF.");
+    }
 
     const splitStartedAt = Date.now();
     const splitter = new RecursiveCharacterTextSplitter({
@@ -120,14 +123,24 @@ export async function loadS3IntoPinecone(
       console.log(`${logPrefix} no_chunks_found`);
       return [];
     }
+    const nonEmptyChunks = chunks.filter((chunk) => chunk.pageContent.trim().length > 0);
+    if (nonEmptyChunks.length === 0) {
+      throw new Error("PDF text extraction produced only empty chunks.");
+    }
+    if (nonEmptyChunks.length !== chunks.length) {
+      console.log(`${logPrefix} empty_chunks_filtered`, {
+        originalChunks: chunks.length,
+        nonEmptyChunks: nonEmptyChunks.length,
+      });
+    }
 
     const embeddingStartedAt = Date.now();
     const embeddings = getEmbeddingsClient();
     const vectors: number[][] = [];
-    const totalEmbeddingBatches = Math.ceil(chunks.length / EMBEDDING_BATCH_SIZE);
-    for (let offset = 0; offset < chunks.length; offset += EMBEDDING_BATCH_SIZE) {
+    const totalEmbeddingBatches = Math.ceil(nonEmptyChunks.length / EMBEDDING_BATCH_SIZE);
+    for (let offset = 0; offset < nonEmptyChunks.length; offset += EMBEDDING_BATCH_SIZE) {
       const batchStartedAt = Date.now();
-      const batch = chunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
+      const batch = nonEmptyChunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
       const embeddedBatch = await embeddings.embedDocuments(
         batch.map((chunk) => chunk.pageContent)
       );
@@ -138,17 +151,22 @@ export async function loadS3IntoPinecone(
         batchSize: batch.length,
       });
     }
-    stage("all_embeddings_completed", embeddingStartedAt, { vectors: vectors.length });
+    stage("all_embeddings_completed", embeddingStartedAt, {
+      vectors: vectors.length,
+      dimensions: vectors[0]?.length ?? 0,
+    });
 
     const upsertStartedAt = Date.now();
     const pineconeClient = getPineconeClient();
-    const index = pineconeClient.index(process.env.PINECONE_INDEX_NAME!);
+    const indexName = process.env.PINECONE_INDEX_NAME!;
+    const index = pineconeClient.index(indexName);
     const namespace = toVectorNamespace(fileKey);
+    console.log(`${logPrefix} pinecone_target_resolved`, { indexName, namespace });
 
-    const totalUpsertBatches = Math.ceil(chunks.length / UPSERT_BATCH_SIZE);
-    for (let offset = 0; offset < chunks.length; offset += UPSERT_BATCH_SIZE) {
+    const totalUpsertBatches = Math.ceil(nonEmptyChunks.length / UPSERT_BATCH_SIZE);
+    for (let offset = 0; offset < nonEmptyChunks.length; offset += UPSERT_BATCH_SIZE) {
       const batchStartedAt = Date.now();
-      const chunkBatch = chunks.slice(offset, offset + UPSERT_BATCH_SIZE);
+      const chunkBatch = nonEmptyChunks.slice(offset, offset + UPSERT_BATCH_SIZE);
       await index.namespace(namespace).upsert({
         records: chunkBatch.map((chunk, batchIndex) => {
           const vectorIndex = offset + batchIndex;
@@ -176,9 +194,14 @@ export async function loadS3IntoPinecone(
       });
     }
     stage("all_upserts_completed", upsertStartedAt, { namespace, chunks: chunks.length });
-    stage("indexing_completed", runStart, { totalChunks: chunks.length });
+    stage("indexing_completed", runStart, {
+      totalChunks: chunks.length,
+      indexedChunks: nonEmptyChunks.length,
+      indexName,
+      namespace,
+    });
 
-    return chunks;
+    return nonEmptyChunks;
   } finally {
     await unlink(file_name).catch(() => {});
   }
