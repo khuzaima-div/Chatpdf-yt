@@ -11,6 +11,14 @@ type Message = {
   createdAt: Date | string;
 };
 
+type ChatApiSuccess = {
+  messages: Message[];
+};
+
+type ChatApiError = {
+  error?: string;
+};
+
 type Props = {
   chatId: number;
   initialMessages: Message[];
@@ -20,6 +28,7 @@ export default function ChatClient({ chatId, initialMessages }: Props) {
   const [messages, setMessages] = useState<Message[]>(initialMessages);
   const [question, setQuestion] = useState("");
   const [isSending, setIsSending] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   const hasMessages = useMemo(() => messages.length > 0, [messages.length]);
 
@@ -30,6 +39,7 @@ export default function ChatClient({ chatId, initialMessages }: Props) {
 
     setIsSending(true);
     setQuestion("");
+    setSubmitError(null);
 
     const optimisticUserMessage: Message = {
       id: Date.now(),
@@ -48,14 +58,35 @@ export default function ChatClient({ chatId, initialMessages }: Props) {
       });
 
       if (!response.ok) {
-        throw new Error("Failed to send question");
+        let errorMessage = "Failed to send question";
+        try {
+          const errorPayload = (await response.json()) as ChatApiError;
+          if (typeof errorPayload?.error === "string" && errorPayload.error.trim()) {
+            errorMessage = errorPayload.error;
+          }
+        } catch {
+          try {
+            const text = await response.text();
+            if (text.trim()) {
+              errorMessage = text;
+            }
+          } catch {
+            // Keep default message.
+          }
+        }
+        throw new Error(errorMessage);
       }
 
-      const data = (await response.json()) as { messages: Message[] };
+      const data = (await response.json()) as ChatApiSuccess;
       setMessages(data.messages);
     } catch (error) {
       console.error(error);
       setMessages((prev) => prev.filter((m) => m.id !== optimisticUserMessage.id));
+      const message =
+        error instanceof Error && error.message.trim()
+          ? error.message
+          : "Failed to send question";
+      setSubmitError(message);
     } finally {
       setIsSending(false);
     }
@@ -124,6 +155,9 @@ export default function ChatClient({ chatId, initialMessages }: Props) {
         onSubmit={onSubmit}
         className="sticky bottom-0 rounded-2xl border border-white/10 bg-slate-900/70 p-3 shadow-lg shadow-black/20 backdrop-blur md:p-4"
       >
+        {submitError && (
+          <p className="mb-2 text-xs text-rose-300">{submitError}</p>
+        )}
         <div className="flex items-center gap-2">
           <input
             value={question}

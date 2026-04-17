@@ -71,7 +71,7 @@ function FileUpload() {
         const chatResponse = await mutateAsync(data);
         console.log("create-chat response:", chatResponse);
         console.log("uploaded file payload:", data);
-        toast.success("File uploaded. Indexing started in background ✅", { id: "upload" });
+        toast.success("File uploaded. ✅", { id: "upload" });
         if (chatResponse?.chatId) {
           router.push(`/chat/${chatResponse.chatId}`);
         }

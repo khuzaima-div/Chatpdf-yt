@@ -1,15 +1,10 @@
 import { Pinecone } from "@pinecone-database/pinecone";
 import { downloadFileFromS3 } from "../s3-server";
-import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { unlink } from "fs/promises";
+import { readFile } from "fs/promises";
 import { getEmbeddingsClient } from "../ai/embeddings";
 import { toVectorNamespace } from "../chat/namespace";
-
-export type PdfPage = {
-  pageContent: string;
-  metadata: Record<string, unknown>;
-};
 
 export type PdfChunk = {
   id: string;
@@ -62,24 +57,35 @@ export async function loadS3IntoPinecone(
   assertPineconeConfig();
 
   const downloadStartedAt = Date.now();
-  const file_name = await downloadFileFromS3(fileKey);
-  stage("s3_download_completed", downloadStartedAt, { tempFile: file_name });
+  const tempFile = await downloadFileFromS3(fileKey);
+  stage("s3_download_completed", downloadStartedAt, { tempFile });
 
-  if (!file_name) {
+  if (!tempFile) {
     throw new Error("Failed to download file from S3");
   }
 
   try {
     const parseStartedAt = Date.now();
-    const loader = new PDFLoader(file_name);
-    const rawPages = await loader.load();
-    const pages: PdfPage[] = rawPages.map((page) => ({
-      pageContent: String(page.pageContent ?? ""),
-      metadata: (page.metadata ?? {}) as Record<string, unknown>,
-    }));
-    stage("pdf_loaded", parseStartedAt, { pages: pages.length });
-    if (pages.length === 0) {
-      throw new Error("No pages were extracted from the uploaded PDF.");
+    // Force v1 parser entrypoint to avoid fallback test-file behavior.
+    const pdfParseModule = await import("pdf-parse/lib/pdf-parse.js");
+    const pdfParse = pdfParseModule.default as (buffer: Buffer) => Promise<{
+      text?: string;
+      numpages?: number;
+    }>;
+    const fileBuffer = await readFile(tempFile);
+    if (!fileBuffer || fileBuffer.length === 0) {
+      throw new Error(`Downloaded PDF is empty: ${tempFile}`);
+    }
+    const parsed = await pdfParse(fileBuffer);
+    const fullText = String(parsed.text ?? "").trim();
+    stage("pdf_loaded", parseStartedAt, {
+      tempFile,
+      bytes: fileBuffer.length,
+      pages: typeof parsed.numpages === "number" ? parsed.numpages : null,
+      textLength: fullText.length,
+    });
+    if (!fullText) {
+      throw new Error("No text was extracted from the uploaded PDF.");
     }
 
     const splitStartedAt = Date.now();
@@ -88,35 +94,18 @@ export async function loadS3IntoPinecone(
       chunkOverlap: 200,
     });
 
-    const chunks: PdfChunk[] = [];
-
-    for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
-      const page = pages[pageIndex];
-      const pageChunks = await splitter.splitText(page.pageContent);
-      for (let i = 0; i < pageChunks.length; i++) {
-        const pageNumber =
-          typeof page.metadata.loc === "object" &&
-          page.metadata.loc !== null &&
-          "pageNumber" in page.metadata.loc
-            ? Number((page.metadata.loc as { pageNumber?: number }).pageNumber ?? null)
-            : pageIndex + 1;
-
-        chunks.push({
-          id: `${fileKey}-${pageNumber ?? pageIndex + 1}-${i}`,
-          pageContent: pageChunks[i],
-          metadata: {
-            pageNumber,
-            chunkIndex: i,
-            fileKey,
-            fileName: fileName ?? null,
-            source:
-              typeof page.metadata.source === "string"
-                ? page.metadata.source
-                : null,
-          },
-        });
-      }
-    }
+    const rawChunks = await splitter.splitText(fullText);
+    const chunks: PdfChunk[] = rawChunks.map((chunkText, index) => ({
+      id: `${fileKey}-chunk-${index}`,
+      pageContent: chunkText,
+      metadata: {
+        pageNumber: null,
+        chunkIndex: index,
+        fileKey,
+        fileName: fileName ?? null,
+        source: null,
+      },
+    }));
     stage("chunks_created", splitStartedAt, { chunks: chunks.length });
 
     if (chunks.length === 0) {
@@ -203,6 +192,6 @@ export async function loadS3IntoPinecone(
 
     return nonEmptyChunks;
   } finally {
-    await unlink(file_name).catch(() => {});
+    await unlink(tempFile).catch(() => {});
   }
 }

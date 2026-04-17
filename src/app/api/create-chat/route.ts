@@ -6,8 +6,39 @@ import { toErrorDetails, toErrorResponse } from "@/lib/server/errors";
 import { withTimeout } from "@/lib/server/timeout";
 import { createChatRecord, findExistingChatByFile } from "@/lib/db/chat-queries";
 import { createRequestTimer } from "@/lib/server/request-timing";
+import { getPineconeClient } from "@/lib/vector/pinecone";
 
 const DB_TIMEOUT_MS = 12000;
+const VECTOR_CHECK_TIMEOUT_MS = 12000;
+
+async function getNamespaceVectorCount(fileKey: string): Promise<number | null> {
+  if (!process.env.PINECONE_INDEX_NAME) {
+    return null;
+  }
+
+  try {
+    const pinecone = getPineconeClient();
+    const index = pinecone.index(process.env.PINECONE_INDEX_NAME);
+    const namespace = toVectorNamespace(fileKey);
+    const stats = await withTimeout(
+      index.describeIndexStats(),
+      VECTOR_CHECK_TIMEOUT_MS,
+      "Timed out while checking Pinecone index stats."
+    );
+    const namespaceStats = stats.namespaces?.[namespace];
+    if (!namespaceStats) {
+      return 0;
+    }
+    return typeof namespaceStats.recordCount === "number" ? namespaceStats.recordCount : 0;
+  } catch (error) {
+    console.error("[/api/create-chat] pinecone_namespace_check_failed", {
+      fileKey,
+      namespace: toVectorNamespace(fileKey),
+      ...toErrorDetails(error),
+    });
+    return null;
+  }
+}
 
 export async function POST(request: Request) {
   const requestId = crypto.randomUUID();
@@ -23,7 +54,12 @@ export async function POST(request: Request) {
     }
 
     const payloadParseStartedAt = Date.now();
-    const body = await request.json();
+    let body: { file_key?: string; file_name?: string };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
     timer.stage("payload_parsed", payloadParseStartedAt);
     const { file_key, file_name } = body;
     if (!file_key || !file_name) {
@@ -51,13 +87,44 @@ export async function POST(request: Request) {
     });
 
     if (existingChat) {
+      const vectorCount = await getNamespaceVectorCount(file_key);
+      const needsReindex = vectorCount === 0;
+      if (needsReindex) {
+        after(async () => {
+          const startedAt = Date.now();
+          console.log(`[/api/create-chat][${requestId}] reindex_for_existing_chat_started`, {
+            chatId: existingChat.id,
+            file_key,
+          });
+          try {
+            const { loadS3IntoPinecone } = await import("@/lib/vector/pinecone");
+            await loadS3IntoPinecone(file_key, file_name, {
+              requestId,
+              chatId: existingChat.id,
+            });
+            console.log(`[/api/create-chat][${requestId}] reindex_for_existing_chat_completed`, {
+              chatId: existingChat.id,
+              durationMs: Date.now() - startedAt,
+            });
+          } catch (indexError) {
+            console.error(`[/api/create-chat][${requestId}] reindex_for_existing_chat_failed`, {
+              chatId: existingChat.id,
+              durationMs: Date.now() - startedAt,
+              ...toErrorDetails(indexError),
+            });
+          }
+        });
+      }
+
       console.log(`[/api/create-chat][${requestId}] existing_chat_reused`, {
         chatId: existingChat.id,
+        vectorCount,
+        needsReindex,
         durationMs: Date.now() - timer.startedAt,
       });
       return NextResponse.json({
         chatId: existingChat.id,
-        indexingStatus: "already_exists",
+        indexingStatus: needsReindex ? "processing" : "already_exists",
         namespace: toVectorNamespace(file_key),
       });
     }
